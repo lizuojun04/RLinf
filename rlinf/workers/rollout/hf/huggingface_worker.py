@@ -76,6 +76,12 @@ class MultiStepRolloutWorker(Worker):
         )
         self.eval_rollout_epoch = eval_env_cfg.rollout_epoch if self.enable_eval else 1
         self.collect_transitions = self.cfg.rollout.get("collect_transitions", False)
+        # SAFE hidden-state collection: forward suffix_out (pre-velocity) hidden
+        # states to the env worker during eval for offline failure-detector training.
+        safe_dump_cfg = self.cfg.rollout.get("safe_dump", {}) or {}
+        self.collect_hidden_states = bool(
+            OmegaConf.select(safe_dump_cfg, "enabled", default=False)
+        )
         self.enable_dagger = self.algorithm_cfg.get("loss_type") == "embodied_dagger"
         self.enable_opd = self.algorithm_cfg.get("adv_type") == "opd"
         self.expert_model = None
@@ -145,6 +151,16 @@ class MultiStepRolloutWorker(Worker):
             rollout_model_config.model_path = self.cfg.rollout.model.model_path
 
         self.hf_model: BasePolicy = get_model(rollout_model_config)
+
+        if self.collect_hidden_states:
+            # Force the openpi model to export suffix_out hidden states (SAFE dump).
+            # OpenPi0Config is frozen, so mutate its __dict__ directly.
+            cfg_obj = getattr(self.hf_model, "config", None)
+            if cfg_obj is None:
+                raise ValueError(
+                    "rollout.safe_dump.enabled requires a model exposing `.config`"
+                )
+            cfg_obj.__dict__["collect_hidden_states"] = True
 
         if self.cfg.runner.get("ckpt_path", None):
             model_dict = torch.load(self.cfg.runner.ckpt_path)
@@ -829,7 +845,7 @@ class MultiStepRolloutWorker(Worker):
                             merge_fn=self._merge_obs_batches,
                             infer_batch_size_fn=self._infer_env_batch_size,
                         ).async_wait()
-                        actions, _ = self._predict_rollout_actions(
+                        actions, result = self._predict_rollout_actions(
                             env_output["obs"],
                             mode="eval",
                             final_obs=env_output.get("final_obs", None),
@@ -838,15 +854,35 @@ class MultiStepRolloutWorker(Worker):
                         )
                         if isinstance(actions, torch.Tensor):
                             actions = actions.detach().cpu().contiguous()
-                        self.send_to(
-                            group_name=self.cfg.env.group_name,
-                            channel=output_channel,
-                            data=actions,
-                            tag="eval_rollout_results",
-                            route_key=stage_id,
-                            async_op=True,
-                            batch_size=self.eval_batch_size,
-                        )
+                        if self.collect_hidden_states:
+                            # Package actions + per-env hidden states so the env worker
+                            # can write SAFE env_records/policy_records on episode end.
+                            data = {"actions": actions}
+                            fixture = result.get("forward_inputs") or {}
+                            hidden_states = fixture.get("hidden_states", None)
+                            if hidden_states is not None:
+                                if isinstance(hidden_states, torch.Tensor):
+                                    hidden_states = hidden_states.detach().cpu()
+                                data["hidden_states"] = hidden_states
+                            self.send_to(
+                                group_name=self.cfg.env.group_name,
+                                channel=output_channel,
+                                data=data,
+                                tag="eval_rollout_results",
+                                route_key=stage_id,
+                                async_op=True,
+                                batch_size=self.eval_batch_size,
+                            )
+                        else:
+                            self.send_to(
+                                group_name=self.cfg.env.group_name,
+                                channel=output_channel,
+                                data=actions,
+                                tag="eval_rollout_results",
+                                route_key=stage_id,
+                                async_op=True,
+                                batch_size=self.eval_batch_size,
+                            )
 
             if self.enable_offload:
                 self.offload_model()

@@ -14,6 +14,8 @@
 
 import asyncio
 import gc
+import os
+import pickle
 from collections import defaultdict
 from typing import Any
 
@@ -78,6 +80,25 @@ class EnvWorker(Worker):
         self.enable_rlt = (
             OmegaConf.select(self.cfg, "algorithm.loss_type", default="") == "rlt_ac"
         )
+
+        # SAFE hidden-state collection: dump per-step hidden states + success labels
+        # to disk in SAFE's env_records/policy_records format during eval. Enabled
+        # when rollout.safe_dump.enabled is set (model side must also set
+        # rollout.model.collect_hidden_states=True to export suffix_out).
+        safe_dump_cfg = self.cfg.rollout.get("safe_dump", {}) or {}
+        self.collect_hidden_states = bool(
+            OmegaConf.select(safe_dump_cfg, "enabled", default=False)
+        )
+        self.safe_dump_save_dir = str(
+            OmegaConf.select(safe_dump_cfg, "save_dir", default="")
+        )
+        if self.collect_hidden_states and not self.safe_dump_save_dir:
+            raise ValueError(
+                "rollout.safe_dump.enabled=True requires rollout.safe_dump.save_dir"
+            )
+        # Per-eval-stage episode buffers for SAFE hidden-state collection.
+        self._safe_episode_buffers: list[list[dict[str, Any]]] = []
+        self._safe_task_id_map: list[dict[str, int]] = []
 
         self.reward_mode = self.cfg.get("reward", {}).get("reward_mode", "per_step")
         self.history_reward_assign = self.cfg.get("reward", {}).get(
@@ -525,9 +546,13 @@ class EnvWorker(Worker):
 
     def env_evaluate_step(
         self, raw_actions: torch.Tensor, stage_id: int
-    ) -> tuple[EnvOutput, dict[str, Any]]:
+    ) -> tuple[EnvOutput, dict[str, Any], torch.Tensor]:
         """
         This function is used to evaluate the environment.
+
+        Returns:
+            (env_output, env_info, newly_done): ``newly_done`` is a per-env bool
+            tensor indicating which envs finished an episode in this chunk step.
         """
         chunk_actions = prepare_actions(
             raw_chunk_actions=raw_actions,
@@ -586,7 +611,7 @@ class EnvWorker(Worker):
             env_infos=infos if isinstance(infos, dict) else None,
             rlt_switch_flags=rlt_switch_flags,
         )
-        return env_output, env_info
+        return env_output, env_info, newly_done
 
     def _build_chunk_final_obs(self, obs_list, infos_list):
         """Build per-env terminal observations for a whole chunk.
@@ -1268,6 +1293,168 @@ class EnvWorker(Worker):
 
         return env_metrics
 
+    # ---- SAFE hidden-state collection helpers ------------------------------------
+
+    def _safe_init_episode_state(self, stage_id: int, reset_obs, episode_idx_start: int = 0):
+        num_envs = self.eval_num_envs_per_stage
+        self._safe_episode_buffers[stage_id] = []
+        self._safe_task_id_map[stage_id] = {}
+        for env_idx in range(num_envs):
+            task_desc = self._safe_extract_task_desc(reset_obs, env_idx)
+            task_id = self._safe_get_task_id(stage_id, task_desc)
+            self._safe_episode_buffers[stage_id].append(
+                {
+                    "hidden_states": [],
+                    "actions": [],
+                    "task_id": task_id,
+                    "task_desc": task_desc,
+                    "episode_idx": episode_idx_start,
+                }
+            )
+
+    def _safe_extract_task_desc(self, obs, env_idx: int) -> str:
+        if not isinstance(obs, dict):
+            return "unknown_task"
+        desc = obs.get("task_descriptions")
+        if isinstance(desc, (list, tuple)):
+            if len(desc) == self.eval_num_envs_per_stage:
+                return str(desc[env_idx])
+            return str(desc[0]) if desc else "unknown_task"
+        return "unknown_task" if desc is None else str(desc)
+
+    def _safe_get_task_id(self, stage_id: int, task_desc: str) -> int:
+        """Assign a stable integer task_id per unique task description per stage."""
+        task_map = self._safe_task_id_map[stage_id]
+        if task_desc not in task_map:
+            task_map[task_desc] = len(task_map)
+        return task_map[task_desc]
+
+    def _safe_append_hidden_states(
+        self, stage_id: int, hidden_states, model_action_chunk
+    ) -> None:
+        """Accumulate this chunk step's hidden states into per-env buffers.
+
+        ``hidden_states`` has shape ``(num_envs_for_stage, num_steps, action_horizon,
+        hidden_dim)`` — the raw per-denoi-step backbone features (SAFE ``pre_velocity``).
+        Each env's ``(num_steps, action_horizon, hidden_dim)`` feature is appended to its
+        current episode's buffer. ``model_action_chunk`` is the model's predicted action
+        chunk, shape ``(num_envs_for_stage, num_action_chunks * action_dim)``.
+        """
+        if not self.collect_hidden_states:
+            return
+        if hidden_states is None:
+            return
+        hidden_states = (
+            hidden_states.detach().cpu() if torch.is_tensor(hidden_states) else hidden_states
+        )
+        hidden_states = np.asarray(hidden_states, dtype=np.float32)
+        model_action_chunk = np.asarray(model_action_chunk, dtype=np.float32)
+        buffers = self._safe_episode_buffers[stage_id]
+        num_envs = self.eval_num_envs_per_stage
+        action_dim = self.model_cfg.action_dim
+        for env_idx in range(num_envs):
+            feat = hidden_states[env_idx] if hidden_states.shape[0] == num_envs else hidden_states[0]
+            buffers[env_idx]["hidden_states"].append(feat)
+            action = (
+                model_action_chunk[env_idx]
+                if model_action_chunk.shape[0] == num_envs
+                else model_action_chunk[0]
+            )
+            action = action.reshape(-1, action_dim).astype(np.float32)
+            buffers[env_idx]["actions"].append(action)
+
+    def _safe_flush_episodes(
+        self,
+        stage_id: int,
+        newly_done: torch.Tensor,
+        env_info: dict,
+    ) -> None:
+        """Write finished episodes to disk in SAFE's env_records/policy_records format.
+
+        Only envs flagged ``newly_done`` are finalized. ``env_info`` carries the
+        ``episode``-level keys (e.g. ``success_once``) sliced over ``newly_done``,
+        indexed in the same order as the done envs.
+        """
+        if not self.collect_hidden_states:
+            return
+        newly_done = newly_done.detach().cpu() if torch.is_tensor(newly_done) else newly_done
+        done_idx = [i for i, d in enumerate(newly_done) if bool(d)]
+        if not done_idx:
+            return
+
+        env_records_dir = os.path.join(self.safe_dump_save_dir, "env_records")
+        policy_records_dir = os.path.join(self.safe_dump_save_dir, "policy_records")
+        os.makedirs(env_records_dir, exist_ok=True)
+        os.makedirs(policy_records_dir, exist_ok=True)
+
+        buffers = self._safe_episode_buffers[stage_id]
+        # Per-env success from episode info (indexed over newly_done envs).
+        success_list = self._safe_extract_success_list(env_info, len(done_idx))
+        step_counter = 0
+        for rank_in_done, env_idx in enumerate(done_idx):
+            buf = buffers[env_idx]
+            hidden_states = buf["hidden_states"]
+            actions = buf["actions"]
+            if not hidden_states:
+                continue
+            episode_success = int(bool(success_list[rank_in_done]))
+            env_rec = {
+                "task_suite_name": "robocasa",
+                "task_id": buf["task_id"],
+                "task_description": buf["task_desc"],
+                "episode_idx": buf["episode_idx"],
+                "episode_success": episode_success,
+                "model_infer_times": len(hidden_states),
+                "replan_steps": self._safe_replan_steps(),
+            }
+            ep_filename = (
+                f"rank{self._rank}_stage{stage_id}_env{env_idx}_"
+                f"ep{buf['episode_idx']}.pkl"
+            )
+            with open(os.path.join(env_records_dir, ep_filename), "wb") as f:
+                pickle.dump(env_rec, f)
+
+            for i, feat in enumerate(hidden_states):
+                policy_rec = {
+                    "pre_velocity": feat,  # (num_steps, action_horizon, hidden_dim) raw
+                    "actions": actions[i],  # (pred_horizon, action_dim)
+                }
+                with open(
+                    os.path.join(
+                        policy_records_dir,
+                        f"rank{self._rank}_stage{stage_id}_env{env_idx}_"
+                        f"ep{buf['episode_idx']}_step{i}.meta.pkl",
+                    ),
+                    "wb",
+                ) as f:
+                    pickle.dump(policy_rec, f)
+            step_counter += len(hidden_states)
+
+            # Reset this env's buffer for the next episode.
+            buf["hidden_states"] = []
+            buf["actions"] = []
+            buf["episode_idx"] += 1
+
+    def _safe_replan_steps(self) -> int:
+        """Number of env steps per policy call (action chunk length)."""
+        num_action_chunks = 1
+        if self.model_cfg is not None and hasattr(self.model_cfg, "num_action_chunks"):
+            num_action_chunks = self.model_cfg.num_action_chunks
+        return max(int(num_action_chunks), 1)
+
+    def _safe_extract_success_list(self, env_info: dict, n: int) -> list[bool]:
+        """Extract per-env success flags for ``n`` newly-done envs."""
+        if not env_info:
+            return [False] * n
+        for key in ("success_once", "success_at_end", "success"):
+            if key not in env_info:
+                continue
+            val = env_info[key]
+            if isinstance(val, torch.Tensor):
+                return [bool(v) for v in val.reshape(-1).tolist()]
+            return [bool(v) for v in np.asarray(val).reshape(-1).tolist()]
+        return [False] * n
+
     @Worker.timer("evaluate")
     def evaluate(self, input_channel: Channel, rollout_channel: Channel):
         eval_metrics = defaultdict(list)
@@ -1279,6 +1466,16 @@ class EnvWorker(Worker):
                         self.eval_num_envs_per_stage, dtype=torch.bool
                     )
                     extracted_obs, infos = self.eval_env_list[stage_id].reset()
+                    if self.collect_hidden_states:
+                        # Grow the per-stage buffer list if needed (stage may be visited
+                        # out of order across epochs).
+                        while len(self._safe_episode_buffers) <= stage_id:
+                            self._safe_episode_buffers.append([])
+                            self._safe_task_id_map.append({})
+                        self._safe_init_episode_state(
+                            stage_id, extracted_obs,
+                            episode_idx_start=0,
+                        )
                     env_output = EnvOutput(
                         obs=extracted_obs,
                         final_obs=(
@@ -1317,13 +1514,29 @@ class EnvWorker(Worker):
                         if hasattr(rollout_results, "actions")
                         else rollout_results
                     )
+                    # When SAFE hidden-state collection is active the data is a dict
+                    # {"actions": ..., "hidden_states": ...}. Peel off the actions.
+                    hidden_states_this_step = None
+                    if isinstance(raw_chunk_actions, dict):
+                        hidden_states_this_step = raw_chunk_actions.get("hidden_states", None)
+                        raw_chunk_actions = raw_chunk_actions["actions"]
                     if isinstance(raw_chunk_actions, torch.Tensor):
                         raw_chunk_actions = raw_chunk_actions.detach().cpu().numpy()
                     else:
                         raw_chunk_actions = np.asarray(raw_chunk_actions)
-                    env_output, env_info = self.env_evaluate_step(
+                    # Keep the model's predicted action chunk (pre-transform) for SAFE
+                    # policy_records `actions` (pred_horizon, action_dim).
+                    model_action_chunk = np.asarray(raw_chunk_actions, dtype=np.float32)
+                    env_output, env_info, newly_done = self.env_evaluate_step(
                         raw_chunk_actions, stage_id
                     )
+
+                    # Accumulate this step's hidden states + actions and flush completed episodes.
+                    if self.collect_hidden_states and hidden_states_this_step is not None:
+                        self._safe_append_hidden_states(
+                            stage_id, hidden_states_this_step, model_action_chunk
+                        )
+                        self._safe_flush_episodes(stage_id, newly_done, env_info)
 
                     for key, value in env_info.items():
                         eval_metrics[key].append(value)

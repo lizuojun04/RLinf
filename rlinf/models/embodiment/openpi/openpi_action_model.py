@@ -73,6 +73,9 @@ class OpenPi0Config(Pi0Config):
     value_after_vlm: bool = False  # value after vlm, pi05 mode
     value_vlm_mode: str = "mean_token"  # last_token, mean_token, first_token
 
+    # hidden-state capture for failure detection (SAFE)
+    collect_hidden_states: bool = False  # export suffix_out (pre-velocity) for SAFE dumps
+
     # ===== DSRL-specific parameters =====
     use_dsrl: bool = False  # Enable DSRL algorithm
     dsrl_state_dim: int = 8  # Raw state dimension for DSRL encoders
@@ -908,6 +911,10 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             }
             forward_inputs.update(nft_outputs)
 
+        if self.config.collect_hidden_states and "hidden_states" in outputs:
+            # (B, num_steps, hidden_dim) mean-aggregated per-denoi-step features (SAFE pre-velocity).
+            forward_inputs["hidden_states"] = outputs["hidden_states"]
+
         # Clone observations to avoid cross-step reference issues.
         cloned_obs = copy_dict_tensor(
             {k: v for k, v in to_process_obs.items() if k != "prompt"}
@@ -982,6 +989,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         chains = []
         log_probs = []
         values = []
+        hidden_states_per_step = []
         chains.append(x_t)
 
         # add value based on the vlm for pi05, expert for pi0
@@ -1024,7 +1032,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             else:
                 sample_method = "flow_ode"
             x_t_prev = x_t
-            x_t_mean, x_t_std, value_t, v_t = self.sample_mean_var_val(
+            x_t_mean, x_t_std, value_t, v_t, suffix_out = self.sample_mean_var_val(
                 x_t,
                 idx,
                 state,
@@ -1042,6 +1050,11 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             values.append(value_t)
             chains.append(x_t)
             log_probs.append(log_prob)
+            if self.config.collect_hidden_states:
+                # suffix_out: (B, action_horizon, hidden_dim) — raw backbone features
+                # before action_out_proj. Keep raw shape for SAFE (which aggregates
+                # over diff steps + horizon itself).
+                hidden_states_per_step.append(suffix_out)
         x_0 = x_t
         chains = torch.stack(chains, dim=1)
         # post process for logprob
@@ -1070,6 +1083,11 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         if collect_nft_state:
             result.update(nft_state)
             result["nft_x0"] = x_0.detach()
+        if self.config.collect_hidden_states:
+            # (B, num_steps, action_horizon, hidden_dim) raw per-denoi-step features
+            # (SAFE `pre_velocity`).
+            result["hidden_states"] = torch.stack(hidden_states_per_step, dim=1)
+
         return result
 
     def _get_timesteps(self, denoise_steps, device):
@@ -1150,7 +1168,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         else:
             raise ValueError(f"Invalid noise method: {sample_method}")
         x_t_mean = x0_pred * x0_weight + x1_pred * x1_weight
-        return x_t_mean, x_t_std, value_t, v_t
+        return x_t_mean, x_t_std, value_t, v_t, suffix_out
 
     def get_suffix_out(
         self,
@@ -1294,7 +1312,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             denoise_ind = denoise_inds[:, idx]
             chains_pre = chains[batch_indices, denoise_ind]
             chains_next = chains[batch_indices, denoise_ind + 1]
-            x_t_mean, x_t_std, value_t, _ = self.sample_mean_var_val(
+            x_t_mean, x_t_std, value_t, _, _ = self.sample_mean_var_val(
                 chains_pre,
                 denoise_ind,
                 state,
