@@ -1,0 +1,7 @@
+.venv-safe/
+*.egg-info/
+__pycache__/
+**/__pycache__/
+wandb/
+logs/
+outputs/

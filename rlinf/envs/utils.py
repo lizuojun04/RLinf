@@ -42,6 +42,13 @@ def get_env_attr(env, name: str, default: Any = None) -> Any:
     while older gymnasium/gym and custom wrappers rely on ``__getattr__``
     delegation through plain ``getattr``.
 
+    Note: gymnasium < 1.0 (e.g. 0.29) implements ``get_wrapper_attr`` as an
+    unconditional delegation to ``self.env.get_wrapper_attr``, so it raises
+    ``AttributeError`` as soon as the wrapper chain bottoms out at a plain
+    ``gym.Env`` (which lacks the method) even when the attribute exists there.
+    We therefore fall back to plain ``getattr`` instead of returning
+    ``default`` whenever the wrapper-based lookup fails.
+
     Args:
         env: The (possibly wrapped) environment.
         name: The attribute name to look up.
@@ -54,7 +61,7 @@ def get_env_attr(env, name: str, default: Any = None) -> Any:
         try:
             return env.get_wrapper_attr(name)
         except AttributeError:
-            return default
+            pass
     return getattr(env, name, default)
 
 

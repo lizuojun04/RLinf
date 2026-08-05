@@ -28,6 +28,7 @@ except ImportError:
     torch = None
 
 from rlinf.envs.utils import put_info_on_image, tile_images
+from rlinf.envs.wrappers.record_video_score import add_red_border, build_score_panel
 
 
 class RecordVideo(gym.Wrapper):
@@ -78,6 +79,23 @@ class RecordVideo(gym.Wrapper):
         self._num_envs = getattr(env, "num_envs", 1)
         self._executor = ThreadPoolExecutor(max_workers=1)
         self._save_futures: list[Future] = []
+
+        # SAFE side-by-side overlay state (see set_safe_scores / flush_video).
+        safe_cfg = (
+            self.video_cfg.get("safe_score_overlay", {})
+            if hasattr(self.video_cfg, "get")
+            else getattr(self.video_cfg, "safe_score_overlay", {})
+        )
+        self._safe_overlay_enabled = bool(
+            safe_cfg.get("enabled", False) if hasattr(safe_cfg, "get") else safe_cfg
+        )
+        self._safe_scores: Optional[list] = None
+        self._safe_detections: Optional[list] = None
+        self._safe_band: Optional[np.ndarray] = None
+        self._safe_replan_steps: int = 1
+        self._safe_success: Optional[int] = None
+        self._safe_pred_failure: Optional[bool] = None
+        self._safe_title_lines: Optional[list] = None
 
         if fps is not None:
             self._fps = fps
@@ -435,6 +453,80 @@ class RecordVideo(gym.Wrapper):
         self.record_video_in_result(result)
         return result
 
+    # ------------------------------------------------------------------ #
+    # SAFE side-by-side overlay
+    # ------------------------------------------------------------------ #
+    def set_safe_scores(
+        self,
+        scores,
+        detections,
+        band,
+        replan_steps: int = 1,
+        success: Optional[int] = None,
+        detector_predicted_failure: Optional[bool] = None,
+        title_lines: Optional[list] = None,
+    ) -> None:
+        """Provide per-decision-step SAFE scores for the current video.
+
+        Called by the env worker *before* ``flush_video``. The scores/detections
+        are aligned to the buffered frames: decision step ``k`` spans the
+        ``replan_steps`` frames ``[k*replan_steps, (k+1)*replan_steps)``.
+        """
+        self._safe_scores = [float(s) for s in (scores or [])]
+        self._safe_detections = [bool(d) for d in (detections or [])]
+        if band is not None:
+            self._safe_band = np.asarray(band, dtype=np.float64)
+        else:
+            self._safe_band = None
+        self._safe_replan_steps = max(int(replan_steps), 1)
+        self._safe_success = success
+        self._safe_pred_failure = detector_predicted_failure
+        self._safe_title_lines = list(title_lines) if title_lines else None
+
+    def _make_side_by_side_frames(self) -> list[np.ndarray]:
+        """Turn the buffered left frames into left|right side-by-side frames."""
+        if not self._safe_scores or not self.render_images:
+            return self.render_images
+
+        base = self.render_images[0]
+        frame_height = base.shape[0] if base.ndim == 3 else base.shape[-3]
+
+        # Build one panel per decision step and reuse for replan_steps frames.
+        step_panels: list[np.ndarray] = []
+        n_steps = len(self._safe_scores)
+        for k in range(n_steps):
+            step_panels.append(
+                build_score_panel(
+                    frame_height,
+                    self._safe_scores,
+                    self._safe_band,
+                    k + 1,  # show up to and including step k (1-indexed)
+                    self._safe_replan_steps,
+                    flagged=bool(
+                        k < len(self._safe_detections)
+                        and any(self._safe_detections[: k + 1])
+                    ),
+                    success=self._safe_success,
+                    detector_predicted_failure=self._safe_pred_failure,
+                    title_lines=self._safe_title_lines,
+                )
+            )
+
+        frames_per_step = max(self._safe_replan_steps, 1)
+        out = []
+        for f_idx, left_frame in enumerate(self.render_images):
+            step = min(f_idx // frames_per_step, n_steps - 1)
+            panel = step_panels[step]
+            if left_frame.ndim == 3 and panel.ndim == 3:
+                combined = np.concatenate([left_frame, panel], axis=1)
+            else:
+                combined = left_frame
+            # Red border on the left frame when a detection has fired.
+            if step < len(self._safe_detections) and self._safe_detections[step]:
+                combined = add_red_border(combined)
+            out.append(combined)
+        return out
+
     def flush_video(self, video_sub_dir: Optional[str] = None):
         """Write buffered frames to an MP4 file.
 
@@ -457,7 +549,7 @@ class RecordVideo(gym.Wrapper):
 
         os.makedirs(output_dir, exist_ok=True)
         mp4_path = os.path.join(output_dir, f"{self.video_cnt}.mp4")
-        frames = list(self.render_images)
+        frames = self._make_side_by_side_frames()
         self.render_images = []
         self.video_cnt += 1
         future = self._submit_save(frames, mp4_path)

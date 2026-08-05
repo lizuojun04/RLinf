@@ -35,6 +35,10 @@ from rlinf.data.embodied_io_struct import (
 from rlinf.hybrid_engines.weight_syncer import WeightSyncer
 from rlinf.models import get_model
 from rlinf.models.embodiment.base_policy import BasePolicy
+from rlinf.models.embodiment.failure_detector import (
+    SafeFailureDetector,
+    compute_safe_band,
+)
 from rlinf.scheduler import Channel, Cluster, Worker, split_channel_message
 from rlinf.utils.placement import HybridComponentPlacement
 
@@ -82,6 +86,17 @@ class MultiStepRolloutWorker(Worker):
         self.collect_hidden_states = bool(
             OmegaConf.select(safe_dump_cfg, "enabled", default=False)
         )
+        # Real-time SAFE failure scoring: run the trained detector (indep/lstm) on
+        # the openpi suffix_out hidden states at each policy-inference step and
+        # compare against a precomputed functional-CP band. Independent from
+        # safe_dump; records metrics only, never intervenes.
+        safe_score_cfg = self.cfg.rollout.get("safe_score", {}) or {}
+        self.safe_score_enabled = bool(
+            OmegaConf.select(safe_score_cfg, "enabled", default=False)
+        )
+        self.safe_detector = None
+        self.safe_cp_band = None
+        self._safe_score_step_counter: torch.Tensor | None = None
         self.enable_dagger = self.algorithm_cfg.get("loss_type") == "embodied_dagger"
         self.enable_opd = self.algorithm_cfg.get("adv_type") == "opd"
         self.expert_model = None
@@ -161,6 +176,10 @@ class MultiStepRolloutWorker(Worker):
                     "rollout.safe_dump.enabled requires a model exposing `.config`"
                 )
             cfg_obj.__dict__["collect_hidden_states"] = True
+
+        # Load the real-time SAFE failure detector.
+        if self.safe_score_enabled:
+            self._load_safe_detector()
 
         if self.cfg.runner.get("ckpt_path", None):
             model_dict = torch.load(self.cfg.runner.ckpt_path)
@@ -568,6 +587,102 @@ class MultiStepRolloutWorker(Worker):
         result["expert_label_flag"] = bool(expert_label_flag)
         return actions, result
 
+    def _load_safe_detector(self):
+        """Load the real-time SAFE failure detector and compute its CP band.
+
+        Requires ``rollout.safe_score.*`` config and, to obtain the openpi
+        ``suffix_out`` hidden states, forces ``collect_hidden_states=True`` on the
+        model (same effect as ``safe_dump.enabled``).
+
+        The upper functional-CP band is *recomputed at runtime* from the offline
+        calibration rollouts pointed to by ``rollout.safe_score.calibration_data_path``
+        (an RLinf-native dump: any ``**/{success,fail}/*.pkl`` layout of per-rollout
+        pkls), exactly as the SAFE evaluation does — no static band file is read.
+        """
+        safe_cfg = self.cfg.rollout.safe_score
+        ckpt_path = safe_cfg.ckpt_path
+        data_path = safe_cfg.get("calibration_data_path", None)
+        alpha = float(safe_cfg.get("cp_band_alpha", 0.2))
+        model_cfg = dict(OmegaConf.to_container(safe_cfg.model, resolve=True))
+        model_cfg.setdefault("name", safe_cfg.get("detector", "indep"))
+        detector = SafeFailureDetector(model_cfg)
+        state = torch.load(ckpt_path, map_location="cpu")
+        detector.load_state_dict(state)
+        detector.eval()
+        if torch.cuda.is_available():
+            detector = detector.cuda()
+        # Force hidden-state export so suffix_out is available at inference.
+        cfg_obj = getattr(self.hf_model, "config", None)
+        if cfg_obj is None:
+            raise ValueError(
+                "rollout.safe_score.enabled requires a model exposing `.config`"
+            )
+        cfg_obj.__dict__["collect_hidden_states"] = True
+        self.collect_hidden_states = True
+
+        self.safe_detector = detector
+        if not data_path:
+            raise ValueError(
+                "rollout.safe_score.enabled requires rollout.safe_score."
+                "calibration_data_path (a dump root with **/{success,fail}/*.pkl) "
+                "to recompute the functional-CP band."
+            )
+        split_seed = safe_cfg.get("split_seed", 0)
+        shuffle_seed = safe_cfg.get("shuffle_seed", 0)
+        cp_band, info = compute_safe_band(
+            data_path=data_path,
+            detector=detector,
+            alpha=alpha,
+            unseen_task_ratio=float(safe_cfg.get("unseen_task_ratio", 0.3)),
+            seen_train_ratio=float(safe_cfg.get("seen_train_ratio", 0.6)),
+            split_seed=split_seed,
+            shuffle_seed=shuffle_seed,
+        )
+        self.safe_cp_band = cp_band
+        self.safe_cp_alpha = alpha
+        self.safe_cp_info = info
+        self.log_info(
+            f"Loaded SAFE detector {model_cfg['name']} from {ckpt_path}; "
+            f"recomputed functional-CP band (alpha={alpha}, T={cp_band.shape[0]}, "
+            f"n_success_cal={info['n_success_cal']}, data={data_path})."
+        )
+
+    def _reset_safe_history(self, num_envs: int):
+        """Reset the detector's per-episode state for a fresh eval epoch."""
+        if self.safe_detector is None:
+            return
+        self.safe_detector.reset_history(num_envs)
+        self._safe_score_step_counter = torch.zeros(num_envs, dtype=torch.long)
+
+    def _compute_safe_scores(
+        self, result: dict[str, Any], num_envs: int
+    ) -> dict[str, Any] | None:
+        """Run the SAFE detector on the last step's hidden states.
+
+        Returns a dict with per-env ``safe_score``, ``safe_flag`` and
+        ``safe_step`` tensors (CPU), or None if no hidden states / not enabled.
+        """
+        if self.safe_detector is None:
+            return None
+        if self._safe_score_step_counter is None:
+            self._reset_safe_history(num_envs)
+        hidden = (result.get("forward_inputs") or {}).get("hidden_states", None)
+        if hidden is None:
+            return None
+        scores = self.safe_detector.forward_step(hidden).detach().cpu()  # (B,)
+        cp_band = self.safe_cp_band
+        # Edge-extend band for steps beyond its calibrated length T.
+        step_idx = self._safe_score_step_counter.clamp(max=cp_band.shape[0] - 1)
+        thresholds = torch.as_tensor(cp_band, dtype=scores.dtype)[step_idx]
+        flags = (scores >= thresholds).bool()
+        self._safe_score_step_counter += 1
+        return {
+            "safe_score": scores,
+            "safe_flag": flags,
+            "safe_step": self._safe_score_step_counter.clone() - 1,
+            "safe_band": cp_band,
+        }
+
     def _predict_rollout_actions(
         self,
         env_obs: dict[str, Any],
@@ -833,6 +948,9 @@ class MultiStepRolloutWorker(Worker):
                 desc="Evaluating Rollout Epochs",
                 disable=(self._rank != 0),
             ):
+                if self.safe_detector is not None:
+                    # Environments are reset each eval epoch -> new episodes.
+                    self._reset_safe_history(self.eval_batch_size)
                 for _ in range(self.n_eval_chunk_steps):
                     for stage_id in range(self.num_pipeline_stages):
                         env_output = await self.recv_from(
@@ -855,8 +973,9 @@ class MultiStepRolloutWorker(Worker):
                         if isinstance(actions, torch.Tensor):
                             actions = actions.detach().cpu().contiguous()
                         if self.collect_hidden_states:
-                            # Package actions + per-env hidden states so the env worker
-                            # can write SAFE env_records/policy_records on episode end.
+                            # Package actions + per-env hidden states (+ SAFE
+                            # scores) so the env worker can write SAFE records and
+                            # report failure-detection metrics on episode end.
                             data = {"actions": actions}
                             fixture = result.get("forward_inputs") or {}
                             hidden_states = fixture.get("hidden_states", None)
@@ -864,6 +983,11 @@ class MultiStepRolloutWorker(Worker):
                                 if isinstance(hidden_states, torch.Tensor):
                                     hidden_states = hidden_states.detach().cpu()
                                 data["hidden_states"] = hidden_states
+                            safe_extras = self._compute_safe_scores(
+                                result, len(actions)
+                            )
+                            if safe_extras is not None:
+                                data.update(safe_extras)
                             self.send_to(
                                 group_name=self.cfg.env.group_name,
                                 channel=output_channel,

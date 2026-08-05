@@ -17,7 +17,8 @@ import gc
 import os
 import pickle
 from collections import defaultdict
-from typing import Any
+from datetime import datetime
+from typing import Any, Optional
 
 import numpy as np
 import torch
@@ -81,9 +82,10 @@ class EnvWorker(Worker):
             OmegaConf.select(self.cfg, "algorithm.loss_type", default="") == "rlt_ac"
         )
 
-        # SAFE hidden-state collection: dump per-step hidden states + success labels
-        # to disk in SAFE's env_records/policy_records format during eval. Enabled
-        # when rollout.safe_dump.enabled is set (model side must also set
+        # SAFE hidden-state collection: dump per-step hidden states (+ success
+        # labels, and optionally images/states for VLA-style detectors) to disk as
+        # one self-contained pkl per rollout during eval. Enabled when
+        # rollout.safe_dump.enabled is set (model side must also set
         # rollout.model.collect_hidden_states=True to export suffix_out).
         safe_dump_cfg = self.cfg.rollout.get("safe_dump", {}) or {}
         self.collect_hidden_states = bool(
@@ -92,13 +94,46 @@ class EnvWorker(Worker):
         self.safe_dump_save_dir = str(
             OmegaConf.select(safe_dump_cfg, "save_dir", default="")
         )
+        # Whether to also store per-decision-step images (main/wrist/extra views)
+        # and robot state alongside the hidden states.
+        self.safe_dump_store_images = bool(
+            OmegaConf.select(safe_dump_cfg, "store_images", default=True)
+        )
+        # Run identifier for this eval launch: one timestamp shared by all tasks,
+        # so dumps land under <save_dir>/<task_id>/<run_id>/{success,fail}.
+        self._safe_dump_run_id = datetime.now().strftime("%Y%m%d-%H:%M:%S")
         if self.collect_hidden_states and not self.safe_dump_save_dir:
             raise ValueError(
                 "rollout.safe_dump.enabled=True requires rollout.safe_dump.save_dir"
             )
+        # Real-time SAFE failure scoring: the rollout worker ships per-step
+        # safe_score / safe_flag / safe_step for the env worker to aggregate into
+        # per-episode detection metrics (accuracy/TP/FP/TN/FN/avg_det_time) and a
+        # predict_accuracy field in the dumped records.
+        safe_score_cfg = self.cfg.rollout.get("safe_score", {}) or {}
+        self.safe_score_enabled = bool(
+            OmegaConf.select(safe_score_cfg, "enabled", default=False)
+        )
+        if self.safe_score_enabled:
+            # SAFE scoring relies on the same hidden-state forwarding path as
+            # safe_dump; activate it so the env worker accumulates the signals.
+            self.collect_hidden_states = True
+        # If only safe_score is enabled (no safe_dump), still need a place to
+        # write the rollouts (with safe_scores / predict_accuracy). Use a
+        # default path under the log root.
+        if self.safe_score_enabled and not self.safe_dump_save_dir:
+            log_root = self.cfg.runner.logger.get("log_path", "./results")
+            self.safe_dump_save_dir = os.path.join(log_root, "safe_detection")
         # Per-eval-stage episode buffers for SAFE hidden-state collection.
         self._safe_episode_buffers: list[list[dict[str, Any]]] = []
         self._safe_task_id_map: list[dict[str, int]] = []
+        # Per-stage "pre-action" obs cache: the observation the policy saw when
+        # producing the chunk's hidden states. Kept so images/states stored in the
+        # SAFE dump stay aligned with the hidden states.
+        self._safe_last_obs: list[Optional[dict[str, Any]]] = []
+        # The runtime functional-CP band (computed by the rollout worker and shipped
+        # per-step in the SAFE data dict). Cached here for the video overlay.
+        self.safe_cp_band: Optional[np.ndarray] = None
 
         self.reward_mode = self.cfg.get("reward", {}).get("reward_mode", "per_step")
         self.history_reward_assign = self.cfg.get("reward", {}).get(
@@ -1295,20 +1330,45 @@ class EnvWorker(Worker):
 
     # ---- SAFE hidden-state collection helpers ------------------------------------
 
-    def _safe_init_episode_state(self, stage_id: int, reset_obs, episode_idx_start: int = 0):
+    def _safe_init_episode_state(
+        self, stage_id: int, reset_obs, episode_idx_start: int = 0
+    ):
         num_envs = self.eval_num_envs_per_stage
+        # Preserve the per-env episode counters from the previous epoch so
+        # ``auto_reset: False`` evals (which re-init state at every epoch) keep
+        # writing distinct ``ep<N>`` filenames instead of overwriting the
+        # previous epoch's dumps.
+        old_buffers = (
+            self._safe_episode_buffers[stage_id]
+            if stage_id < len(self._safe_episode_buffers)
+            else []
+        )
+        ep_offsets = {
+            i: buf.get("episode_idx", episode_idx_start)
+            for i, buf in enumerate(old_buffers)
+        }
         self._safe_episode_buffers[stage_id] = []
         self._safe_task_id_map[stage_id] = {}
         for env_idx in range(num_envs):
             task_desc = self._safe_extract_task_desc(reset_obs, env_idx)
-            task_id = self._safe_get_task_id(stage_id, task_desc)
+            task_id = self._safe_get_task_id(stage_id, env_idx, task_desc)
             self._safe_episode_buffers[stage_id].append(
                 {
                     "hidden_states": [],
                     "actions": [],
+                    "images": [],
+                    "wrist_images": [],
+                    "extra_view_images": [],
+                    "states": [],
+                    "scores": [],
+                    "detections": [],
+                    "last_scores": [],
+                    "last_detections": [],
+                    "last_success": None,
+                    "last_pred_failure": None,
                     "task_id": task_id,
                     "task_desc": task_desc,
-                    "episode_idx": episode_idx_start,
+                    "episode_idx": ep_offsets.get(env_idx, episode_idx_start),
                 }
             )
 
@@ -1322,15 +1382,41 @@ class EnvWorker(Worker):
             return str(desc[0]) if desc else "unknown_task"
         return "unknown_task" if desc is None else str(desc)
 
-    def _safe_get_task_id(self, stage_id: int, task_desc: str) -> int:
-        """Assign a stable integer task_id per unique task description per stage."""
+    def _safe_get_task_id(self, stage_id: int, env_idx: int, task_desc: str) -> int:
+        """Resolve the SAFE dump ``task_id`` for an env.
+
+        Prefers the environment's own task index (``task_ids`` attribute, e.g.
+        LIBERO's official 0..N-1 task ids derived from the reset-state id) so the
+        dump directories line up with the benchmark's task ids. Falls back to a
+        stable per-task-description counter when the env does not expose
+        ``task_ids`` (e.g. RoboCasa).
+        """
+        env = self.eval_env_list[stage_id]
+        env_task_ids = get_env_attr(env, "task_ids", None)
+        if env_task_ids is not None and env_idx < len(env_task_ids):
+            tid = env_task_ids[env_idx]
+            if tid is not None and int(tid) >= 0:
+                return int(tid)
         task_map = self._safe_task_id_map[stage_id]
         if task_desc not in task_map:
             task_map[task_desc] = len(task_map)
         return task_map[task_desc]
 
+    def _safe_refresh_task_id(self, stage_id: int, env_idx: int, buf: dict) -> None:
+        """Re-resolve the current task_id for ``env_idx`` (the task may change when
+        the episode resets, e.g. LIBERO eval rotates through tasks)."""
+        buf["task_id"] = self._safe_get_task_id(
+            stage_id, env_idx, buf.get("task_desc", "unknown_task")
+        )
+
     def _safe_append_hidden_states(
-        self, stage_id: int, hidden_states, model_action_chunk
+        self,
+        stage_id: int,
+        hidden_states,
+        model_action_chunk,
+        obs=None,
+        safe_score=None,
+        safe_flag=None,
     ) -> None:
         """Accumulate this chunk step's hidden states into per-env buffers.
 
@@ -1339,21 +1425,53 @@ class EnvWorker(Worker):
         Each env's ``(num_steps, action_horizon, hidden_dim)`` feature is appended to its
         current episode's buffer. ``model_action_chunk`` is the model's predicted action
         chunk, shape ``(num_envs_for_stage, num_action_chunks * action_dim)``.
+
+        ``obs`` is the observation dict the policy saw when producing this chunk's
+        hidden states (the "pre-action" obs cached by the caller). Its images
+        (``main_images`` / ``wrist_images`` / ``extra_view_images``) and robot state
+        (``states``) are stored per-step, aligned with the hidden states, for
+        future VLA-style failure detectors.
+
+        When the rollout worker also ships real-time SAFE scores (``safe_score``,
+        ``safe_flag``), they are stored per-step alongside the hidden states for
+        per-episode aggregation.
         """
         if not self.collect_hidden_states:
             return
         if hidden_states is None:
             return
         hidden_states = (
-            hidden_states.detach().cpu() if torch.is_tensor(hidden_states) else hidden_states
+            hidden_states.detach().cpu()
+            if torch.is_tensor(hidden_states)
+            else hidden_states
         )
         hidden_states = np.asarray(hidden_states, dtype=np.float32)
         model_action_chunk = np.asarray(model_action_chunk, dtype=np.float32)
+        if safe_score is not None:
+            safe_score = (
+                safe_score.detach().cpu() if torch.is_tensor(safe_score) else safe_score
+            )
+            safe_score = np.asarray(safe_score, dtype=np.float32)
+        if safe_flag is not None:
+            safe_flag = (
+                safe_flag.detach().cpu() if torch.is_tensor(safe_flag) else safe_flag
+            )
+            safe_flag = np.asarray(safe_flag, dtype=bool)
+        # Per-env image/state extraction from the policy-input obs (pre-action).
+        obs_images = (
+            self._safe_extract_obs_arrays(obs)
+            if obs is not None and self.safe_dump_store_images
+            else None
+        )
         buffers = self._safe_episode_buffers[stage_id]
         num_envs = self.eval_num_envs_per_stage
         action_dim = self.model_cfg.action_dim
         for env_idx in range(num_envs):
-            feat = hidden_states[env_idx] if hidden_states.shape[0] == num_envs else hidden_states[0]
+            feat = (
+                hidden_states[env_idx]
+                if hidden_states.shape[0] == num_envs
+                else hidden_states[0]
+            )
             buffers[env_idx]["hidden_states"].append(feat)
             action = (
                 model_action_chunk[env_idx]
@@ -1362,35 +1480,133 @@ class EnvWorker(Worker):
             )
             action = action.reshape(-1, action_dim).astype(np.float32)
             buffers[env_idx]["actions"].append(action)
+            if obs_images is not None:
+                for key in (
+                    "images",
+                    "wrist_images",
+                    "extra_view_images",
+                    "states",
+                ):
+                    arr = obs_images.get(key)
+                    if arr is None:
+                        continue
+                    val = arr[env_idx] if arr.shape[0] == num_envs else arr[0]
+                    buffers[env_idx][key].append(np.asarray(val))
+            if safe_score is not None:
+                val = float(
+                    safe_score[env_idx]
+                    if safe_score.shape[0] == num_envs
+                    else safe_score[0]
+                )
+                buffers[env_idx].setdefault("scores", []).append(val)
+            if safe_flag is not None:
+                val = bool(
+                    safe_flag[env_idx]
+                    if safe_flag.shape[0] == num_envs
+                    else safe_flag[0]
+                )
+                buffers[env_idx].setdefault("detections", []).append(val)
+
+    @staticmethod
+    def _safe_extract_obs_arrays(obs) -> dict[str, Optional[np.ndarray]]:
+        """Extract per-env image/state arrays from a policy-input obs dict.
+
+        Returns a dict with keys ``images``/``wrist_images``/``extra_view_images``/
+        ``states`` mapped to ``(num_envs, ...)`` float/uint8 arrays, or None-valued
+        entries when the corresponding obs key is absent. Images are returned as
+        uint8 (they are assumed to be ``[B, H, W, C]``); states as float32.
+        """
+        out: dict[str, Optional[np.ndarray]] = {
+            "images": None,
+            "wrist_images": None,
+            "extra_view_images": None,
+            "states": None,
+        }
+        if not isinstance(obs, dict):
+            return out
+        for out_key, obs_key in (
+            ("images", "main_images"),
+            ("wrist_images", "wrist_images"),
+            ("extra_view_images", "extra_view_images"),
+            ("states", "states"),
+        ):
+            arr = obs.get(obs_key)
+            if arr is None:
+                continue
+            if torch.is_tensor(arr):
+                arr = arr.detach().cpu().numpy()
+            arr = np.asarray(arr)
+            if arr.ndim == 0:
+                continue
+            if out_key.endswith("images"):
+                out[out_key] = np.ascontiguousarray(arr, dtype=np.uint8)
+            else:
+                out[out_key] = np.ascontiguousarray(arr, dtype=np.float32)
+        return out
 
     def _safe_flush_episodes(
         self,
         stage_id: int,
         newly_done: torch.Tensor,
         env_info: dict,
-    ) -> None:
-        """Write finished episodes to disk in SAFE's env_records/policy_records format.
+    ) -> dict[str, torch.Tensor]:
+        """Write finished episodes to disk as one self-contained pkl per rollout.
+
+        The output layout is
+        ``<save_dir>/<task_id>/<run_id>/{success,fail}/*.pkl`` — the task dir is
+        the environment's own task id (LIBERO 0..N-1) or a per-description counter
+        fallback, ``<run_id>`` is the eval-launch timestamp, and successful
+        episodes (``episode_success == 1``) go to ``success/``, failed ones to
+        ``fail/``, so downstream training can subsample each class to control the
+        success/fail ratio. Each file holds a single dict with the episode
+        metadata plus per-decision-step aligned arrays (``hidden_states``,
+        ``actions``, ``images``, ``wrist_images``, ``extra_view_images``,
+        ``states``, and optionally the real-time SAFE ``safe_scores`` /
+        ``safe_detections``).
 
         Only envs flagged ``newly_done`` are finalized. ``env_info`` carries the
         ``episode``-level keys (e.g. ``success_once``) sliced over ``newly_done``,
         indexed in the same order as the done envs.
+
+        Returns a dict of per-done-episode scalar tensors (``safe/...``) that the
+        runner aggregates into cross-epoch / cross-env detection metrics (accuracy,
+        TP/FP/TN/FN, average detection time and predict_accuracy). Empty if no SAFE
+        scoring was running (no safe flags recorded).
         """
         if not self.collect_hidden_states:
-            return
-        newly_done = newly_done.detach().cpu() if torch.is_tensor(newly_done) else newly_done
+            return {}
+        newly_done = (
+            newly_done.detach().cpu() if torch.is_tensor(newly_done) else newly_done
+        )
         done_idx = [i for i, d in enumerate(newly_done) if bool(d)]
         if not done_idx:
-            return
+            return {}
 
-        env_records_dir = os.path.join(self.safe_dump_save_dir, "env_records")
-        policy_records_dir = os.path.join(self.safe_dump_save_dir, "policy_records")
-        os.makedirs(env_records_dir, exist_ok=True)
-        os.makedirs(policy_records_dir, exist_ok=True)
+        # Per-task output dirs, created lazily:
+        # <save_dir>/<task_id>/<run_id>/{success,fail}
+        task_dir_cache: dict[int, tuple[str, str]] = {}
+
+        def _task_dirs(task_id: int) -> tuple[str, str]:
+            cached = task_dir_cache.get(task_id)
+            if cached is not None:
+                return cached
+            task_dir = os.path.join(
+                self.safe_dump_save_dir, str(task_id), self._safe_dump_run_id
+            )
+            success_dir = os.path.join(task_dir, "success")
+            fail_dir = os.path.join(task_dir, "fail")
+            os.makedirs(success_dir, exist_ok=True)
+            os.makedirs(fail_dir, exist_ok=True)
+            task_dir_cache[task_id] = (success_dir, fail_dir)
+            return success_dir, fail_dir
 
         buffers = self._safe_episode_buffers[stage_id]
         # Per-env success from episode info (indexed over newly_done envs).
         success_list = self._safe_extract_success_list(env_info, len(done_idx))
-        step_counter = 0
+
+        # Aggregated per-episode safe-detection metrics over the done envs.
+        m_acc, m_tp, m_fp, m_tn, m_fn, m_avg_dt, m_pred_acc = [], [], [], [], [], [], []
+
         for rank_in_done, env_idx in enumerate(done_idx):
             buf = buffers[env_idx]
             hidden_states = buf["hidden_states"]
@@ -1398,42 +1614,101 @@ class EnvWorker(Worker):
             if not hidden_states:
                 continue
             episode_success = int(bool(success_list[rank_in_done]))
-            env_rec = {
+            scores = list(buf.get("scores", []))
+            detections = list(buf.get("detections", []))
+            # predict_accuracy: success & no detection, or failure & detection => correct.
+            # (detections>0 means "SAFE predicted a failure at some step".)
+            pred_failure = bool(any(detections))
+            predict_accuracy = int(
+                (episode_success == 0 and pred_failure)
+                or (episode_success == 1 and not pred_failure)
+            )
+
+            tp = int(episode_success == 0 and pred_failure)
+            fn = int(episode_success == 0 and not pred_failure)
+            fp = int(episode_success == 1 and pred_failure)
+            tn = int(episode_success == 1 and not pred_failure)
+
+            avg_det_time = float("nan")
+            if len(detections) > 0 and episode_success == 0:
+                # Normalized first-detection time among true failures that were flagged.
+                first = next((i for i, d in enumerate(detections) if d), None)
+                if first is not None and len(detections) > 0:
+                    avg_det_time = first / len(detections)
+
+            # Resolve the current task for this episode (the task can change on
+            # reset, e.g. LIBERO eval rotates through tasks) and pick the dir.
+            self._safe_refresh_task_id(stage_id, env_idx, buf)
+            success_dir, fail_dir = _task_dirs(buf["task_id"])
+
+            rollout_rec: dict[str, Any] = {
                 "task_suite_name": "robocasa",
                 "task_id": buf["task_id"],
                 "task_description": buf["task_desc"],
                 "episode_idx": buf["episode_idx"],
                 "episode_success": episode_success,
+                "predict_accuracy": predict_accuracy,
                 "model_infer_times": len(hidden_states),
                 "replan_steps": self._safe_replan_steps(),
+                "hidden_states": np.stack(hidden_states, axis=0).astype(np.float32),
+                "actions": np.stack(actions, axis=0).astype(np.float32),
             }
+            for key in ("images", "wrist_images", "extra_view_images", "states"):
+                vals = list(buf.get(key, []))
+                if vals:
+                    rollout_rec[key] = np.stack(vals, axis=0)
+            if scores:
+                rollout_rec["safe_scores"] = scores
+            if detections:
+                rollout_rec["safe_detections"] = detections
+
             ep_filename = (
                 f"rank{self._rank}_stage{stage_id}_env{env_idx}_"
                 f"ep{buf['episode_idx']}.pkl"
             )
-            with open(os.path.join(env_records_dir, ep_filename), "wb") as f:
-                pickle.dump(env_rec, f)
-
-            for i, feat in enumerate(hidden_states):
-                policy_rec = {
-                    "pre_velocity": feat,  # (num_steps, action_horizon, hidden_dim) raw
-                    "actions": actions[i],  # (pred_horizon, action_dim)
-                }
-                with open(
-                    os.path.join(
-                        policy_records_dir,
-                        f"rank{self._rank}_stage{stage_id}_env{env_idx}_"
-                        f"ep{buf['episode_idx']}_step{i}.meta.pkl",
-                    ),
-                    "wb",
-                ) as f:
-                    pickle.dump(policy_rec, f)
-            step_counter += len(hidden_states)
+            ep_dir = success_dir if episode_success == 1 else fail_dir
+            with open(os.path.join(ep_dir, ep_filename), "wb") as f:
+                pickle.dump(rollout_rec, f)
+            m_acc.append(tp + tn)
+            m_tp.append(tp)
+            m_fp.append(fp)
+            m_tn.append(tn)
+            m_fn.append(fn)
+            m_avg_dt.append(avg_det_time)
+            m_pred_acc.append(predict_accuracy)
 
             # Reset this env's buffer for the next episode.
-            buf["hidden_states"] = []
-            buf["actions"] = []
+            for key in (
+                "hidden_states",
+                "actions",
+                "images",
+                "wrist_images",
+                "extra_view_images",
+                "states",
+                "scores",
+                "detections",
+            ):
+                buf[key] = []
             buf["episode_idx"] += 1
+            # Keep the just-finished episode's verdict + full score trajectory for
+            # the video overlay (buffered scores/detections are cleared above, but
+            # the completed episode's trajectory must survive until the epoch's
+            # video is flushed by _safe_feed_scores_to_video).
+            buf["last_success"] = episode_success
+            buf["last_pred_failure"] = pred_failure
+            buf["last_scores"] = list(scores)
+            buf["last_detections"] = list(detections)
+
+        if not m_pred_acc:
+            return {}
+        return {
+            "safe/tp": torch.as_tensor(m_tp, dtype=torch.float32),
+            "safe/fp": torch.as_tensor(m_fp, dtype=torch.float32),
+            "safe/tn": torch.as_tensor(m_tn, dtype=torch.float32),
+            "safe/fn": torch.as_tensor(m_fn, dtype=torch.float32),
+            "safe/predict_accuracy": torch.as_tensor(m_pred_acc, dtype=torch.float32),
+            "safe/avg_det_time": torch.as_tensor(m_avg_dt, dtype=torch.float32),
+        }
 
     def _safe_replan_steps(self) -> int:
         """Number of env steps per policy call (action chunk length)."""
@@ -1455,6 +1730,64 @@ class EnvWorker(Worker):
             return [bool(v) for v in np.asarray(val).reshape(-1).tolist()]
         return [False] * n
 
+    def _safe_feed_scores_to_video(self) -> bool:
+        """Feed the current epoch's SAFE scores to the RecordVideo wrappers.
+
+        Called right before ``finish_rollout(mode="eval")`` (which flushes a video
+        per eval epoch). For each eval stage that records video, passes the
+        per-env score trajectory (buffered this epoch), the detection flags, and
+        the runtime functional-CP band (computed by the rollout worker and shipped
+        over the SAFE data channel) so the video's right-hand panel can be built.
+
+        Returns True if any stage was fed (for logging / early exit).
+        """
+        if not self.collect_hidden_states:
+            return False
+        eval_video_cfg = self.cfg.env.eval.get("video_cfg", {}) or {}
+        overlay_cfg = eval_video_cfg.get("safe_score_overlay", {}) or {}
+        if not overlay_cfg.get("enabled", False):
+            return False
+        cp_band = self.safe_cp_band
+        if cp_band is None:
+            self.log_warning(
+                "safe_score_overlay enabled but no runtime CP band was received; "
+                "skipping overlay."
+            )
+            return False
+
+        replan_steps = self._safe_replan_steps()
+        fed = False
+        for stage_id in range(self.stage_num):
+            set_safe = get_env_attr(self.eval_env_list[stage_id], "set_safe_scores")
+            if not callable(set_safe):
+                continue
+            buffers = self._safe_episode_buffers[stage_id]
+            num_envs = self.eval_num_envs_per_stage
+            for env_idx in range(min(num_envs, len(buffers))):
+                buf = buffers[env_idx]
+                # Use the last completed episode's trajectory (current buffer may
+                # have just been cleared by _safe_flush_episodes on episode done).
+                scores = list(buf.get("last_scores", []))
+                detections = list(buf.get("last_detections", []))
+                if not scores:
+                    continue
+                pred_failure = bool(any(detections))
+                set_safe(
+                    scores=scores,
+                    detections=detections,
+                    band=cp_band,
+                    replan_steps=replan_steps,
+                    success=buf.get("last_success", None),
+                    detector_predicted_failure=(
+                        pred_failure
+                        if buf.get("last_pred_failure") is not None
+                        else None
+                    ),
+                    title_lines=overlay_cfg.get("title_lines", None),
+                )
+                fed = True
+        return fed
+
     @Worker.timer("evaluate")
     def evaluate(self, input_channel: Channel, rollout_channel: Channel):
         eval_metrics = defaultdict(list)
@@ -1472,10 +1805,15 @@ class EnvWorker(Worker):
                         while len(self._safe_episode_buffers) <= stage_id:
                             self._safe_episode_buffers.append([])
                             self._safe_task_id_map.append({})
+                            self._safe_last_obs.append(None)
                         self._safe_init_episode_state(
-                            stage_id, extracted_obs,
+                            stage_id,
+                            extracted_obs,
                             episode_idx_start=0,
                         )
+                        # The reset obs is the pre-action input for the first
+                        # policy call of this epoch.
+                        self._safe_last_obs[stage_id] = extracted_obs
                     env_output = EnvOutput(
                         obs=extracted_obs,
                         final_obs=(
@@ -1515,28 +1853,58 @@ class EnvWorker(Worker):
                         else rollout_results
                     )
                     # When SAFE hidden-state collection is active the data is a dict
-                    # {"actions": ..., "hidden_states": ...}. Peel off the actions.
+                    # {"actions": ..., "hidden_states": ...., "safe_score": ...,
+                    #  "safe_band": ...}. Peel off the actions / hidden states / safe signals.
                     hidden_states_this_step = None
+                    safe_score_this_step = None
+                    safe_flag_this_step = None
+                    safe_band_this_step = None
                     if isinstance(raw_chunk_actions, dict):
-                        hidden_states_this_step = raw_chunk_actions.get("hidden_states", None)
+                        hidden_states_this_step = raw_chunk_actions.get(
+                            "hidden_states", None
+                        )
+                        safe_score_this_step = raw_chunk_actions.get("safe_score", None)
+                        safe_flag_this_step = raw_chunk_actions.get("safe_flag", None)
+                        safe_band_this_step = raw_chunk_actions.get("safe_band", None)
                         raw_chunk_actions = raw_chunk_actions["actions"]
                     if isinstance(raw_chunk_actions, torch.Tensor):
                         raw_chunk_actions = raw_chunk_actions.detach().cpu().numpy()
                     else:
                         raw_chunk_actions = np.asarray(raw_chunk_actions)
                     # Keep the model's predicted action chunk (pre-transform) for SAFE
-                    # policy_records `actions` (pred_horizon, action_dim).
+                    # rollout dumps `actions` (pred_horizon, action_dim).
                     model_action_chunk = np.asarray(raw_chunk_actions, dtype=np.float32)
                     env_output, env_info, newly_done = self.env_evaluate_step(
                         raw_chunk_actions, stage_id
                     )
 
                     # Accumulate this step's hidden states + actions and flush completed episodes.
-                    if self.collect_hidden_states and hidden_states_this_step is not None:
+                    if (
+                        self.collect_hidden_states
+                        and hidden_states_this_step is not None
+                    ):
+                        if safe_band_this_step is not None:
+                            self.safe_cp_band = np.asarray(
+                                safe_band_this_step.detach().cpu()
+                                if torch.is_tensor(safe_band_this_step)
+                                else safe_band_this_step,
+                                dtype=np.float64,
+                            ).reshape(-1)
                         self._safe_append_hidden_states(
-                            stage_id, hidden_states_this_step, model_action_chunk
+                            stage_id,
+                            hidden_states_this_step,
+                            model_action_chunk,
+                            obs=self._safe_last_obs[stage_id]
+                            if stage_id < len(self._safe_last_obs)
+                            else None,
+                            safe_score=safe_score_this_step,
+                            safe_flag=safe_flag_this_step,
                         )
-                        self._safe_flush_episodes(stage_id, newly_done, env_info)
+                        safe_metric_shards = self._safe_flush_episodes(
+                            stage_id, newly_done, env_info
+                        )
+                        for key, val in safe_metric_shards.items():
+                            eval_metrics[key].append(val)
 
                     for key, value in env_info.items():
                         eval_metrics[key].append(value)
@@ -1560,7 +1928,14 @@ class EnvWorker(Worker):
                         route_key=stage_id if not self.env_decoupled_mode else None,
                         decoupled_mode=self.env_decoupled_mode,
                     )
+                    if self.collect_hidden_states:
+                        # This obs becomes the pre-action input for the next policy
+                        # call; cache it for the next _safe_append_hidden_states.
+                        while len(self._safe_last_obs) <= stage_id:
+                            self._safe_last_obs.append(None)
+                        self._safe_last_obs[stage_id] = env_batch.get("obs", None)
 
+            self._safe_feed_scores_to_video()
             self.finish_rollout(mode="eval")
         for stage_id in range(self.stage_num):
             if self.eval_enable_offload:

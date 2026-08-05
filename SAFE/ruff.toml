@@ -1,0 +1,5 @@
+[lint]
+# Standalone SAFE repo. No copyright-header requirement (CPY001); allow the
+# verbose unpacking patterns copied faithfully from SAFE_origin (RUF059), and
+# the read-only mutable default args (B006) which are never mutated in place.
+ignore = ["CPY001", "RUF059", "B006"]
