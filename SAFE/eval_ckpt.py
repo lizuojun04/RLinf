@@ -53,6 +53,11 @@ def main():
     parser.add_argument("--cp-alphas", default="0.2")
     parser.add_argument("--fixed-thresholds", default="0.5",
                         help="Comma-separated thresholds for fixed-threshold eval (e.g. '0.3,0.5,0.7').")
+    parser.add_argument("--calib-seed", type=int, default=None,
+                        help="Seed for the functional-CP 30/70 calibration split. "
+                             "Default: derive from the ckpt's stored ``best_epoch``/``seed`` "
+                             "(i.e. ``seed * 1000 + best_epoch``) so train/eval match exactly. "
+                             "Set explicitly to override.")
     parser.add_argument("--batch-size", type=int, default=512)
     parser.add_argument("--out-dir", required=True)
     args = parser.parse_args()
@@ -69,6 +74,23 @@ def main():
     model.load_state_dict(ckpt["state_dict"])
     model.to(args.device)
     print(f"Loaded {model_name} ckpt (input_dim={input_dim}) from {args.ckpt}")
+
+    # Derive the functional-CP calibration seed so train/eval use the identical
+    # 30/70 split of the val_seen success scores. train.py stores it as
+    # ``seed * 1000 + best_epoch``; fall back to a bare ckpt-derived value for
+    # checkpoints saved without the field. An explicit --calib-seed overrides.
+    calib_seed = args.calib_seed
+    if calib_seed is None:
+        ckpt_seed = ckpt.get("seed", 0)
+        ckpt_epoch = ckpt.get("best_epoch")
+        if ckpt_epoch is not None:
+            calib_seed = int(ckpt_seed) * 1000 + int(ckpt_epoch)
+        elif "calib_seed" in ckpt:
+            calib_seed = int(ckpt["calib_seed"])
+        else:
+            print("WARNING: ckpt has no best_epoch/calib_seed and --calib-seed not set; "
+                  "functional CP will use a non-deterministic split.")
+    print(f"Functional-CP calib_seed: {calib_seed}")
 
     seed_everything(0)
     all_rollouts = load_rollouts(
@@ -114,6 +136,7 @@ def main():
         df, cp_bands = eval_functional_conformal(
             splits, scores, "model", alphas,
             calib_split_names=["val_seen"], test_split_names=["val_unseen"],
+            calib_seed=calib_seed,
         )
         df.to_csv(os.path.join(args.out_dir, "functional_cp.csv"), index=False)
         print("\n[functional CP, test=val_unseen] by final end")

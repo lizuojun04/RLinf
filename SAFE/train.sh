@@ -5,7 +5,7 @@ UV_PROJECT_ENVIRONMENT=.venv-safe uv run python train.py \
   --data-path ../data/libero \
   --task-ids 0 1 2 6 7 9 \
   --model indep \
-  --n-epochs 250 \
+  --n-epochs 500 \
   --seen-train-ratio 0.75 \
   --unseen-task-ratio 0.33 \
   --max-per-class 20 \

@@ -133,7 +133,17 @@ def eval_functional_conformal(
     calib_split_names: list[str] = ["val_seen"],
     test_split_names: list[str] = ["val_unseen"],
     align_method: str = "extend",
+    calib_seed: int | None = None,
 ) -> tuple[pd.DataFrame, dict]:
+    """Functional conformal prediction (calibrate on successes, test on failures).
+
+    Args:
+        calib_seed: seed for the random 30/70 regression/calibration split of the
+            calibration scores. ``None`` uses the global ``np.random`` (non-
+            reproducible); an int uses an isolated ``np.random.RandomState`` so the
+            split is deterministic and does not disturb the global RNG. Use the same
+            ``calib_seed`` in train and eval to get identical results.
+    """
     classification_logs = []
 
     cal_rollouts, cal_scores_all = [], []
@@ -173,7 +183,8 @@ def eval_functional_conformal(
             cal_scores_1 = cal_scores_used
             cal_scores_2 = cal_scores_used
         else:
-            np.random.shuffle(cal_scores_used)
+            rng = np.random.RandomState(calib_seed) if calib_seed is not None else np.random
+            rng.shuffle(cal_scores_used)
             n_cal_1 = int(len(cal_scores_used) * 0.3)
             cal_scores_1 = cal_scores_used[:n_cal_1]
             cal_scores_2 = cal_scores_used[n_cal_1:]

@@ -177,18 +177,17 @@ def main():
 
         for epoch in range(model_cfg["n_epochs"]):
             model.train()
-            avg_loss = model.train_epoch(optimizer, loader_train)
+            model.train_epoch(optimizer, loader_train)
             if lr_scheduler is not None:
                 lr_scheduler.step()
-
-            # print(f"[seed {seed}] epoch {epoch + 1}/{model_cfg['n_epochs']} avg_loss={avg_loss:.4f}")
 
             if (epoch + 1) % args.roc_every == 0 or (epoch + 1) == model_cfg["n_epochs"]:
                 print('-' * 50)
                 scores = score_rollouts(model, splits, args.batch_size)
+                calib_seed = seed * 1000 + (epoch + 1)
                 metric = _evaluate_and_save(
                     args, model, splits, scores, alphas, fixed_thresholds, cfg_out,
-                    tag=f"ep{epoch + 1}",
+                    tag=f"ep{epoch + 1}", calib_seed=calib_seed,
                 )
                 if metric is not None and metric > best_metric:
                     best_metric = metric
@@ -199,10 +198,13 @@ def main():
                             "input_dim": input_dim,
                             "model_cfg": model_cfg,
                             "state_dict": model.state_dict(),
+                            "seed": seed,
+                            "best_epoch": epoch + 1,
+                            "calib_seed": calib_seed,
                         },
                         os.path.join(cfg_out, "model_best.pt"),
                     )
-                    print(f"  [seed {seed}] new best (bal_acc={metric:.4f}) at epoch {best_epoch}")
+                    print(f"  [seed {seed}] new best (bal_acc={metric:.4f}) at epoch {best_epoch} (calib_seed={calib_seed})")
 
         # Save the final checkpoint
         ckpt_path = os.path.join(cfg_out, "model_final.pt")
@@ -212,6 +214,9 @@ def main():
                 "input_dim": input_dim,
                 "model_cfg": model_cfg,
                 "state_dict": model.state_dict(),
+                "seed": seed,
+                "best_epoch": best_epoch,
+                "calib_seed": best_epoch * 1000 + seed if best_epoch > 0 else seed * 1000 + model_cfg["n_epochs"],
             },
             ckpt_path,
         )
@@ -234,8 +239,14 @@ def main():
             )
 
 
-def _evaluate_and_save(args, model, splits, scores, alphas, fixed_thresholds, out_dir, tag="final") -> float | None:
+def _evaluate_and_save(args, model, splits, scores, alphas, fixed_thresholds, out_dir,
+                       tag="final", calib_seed: int | None = None) -> float | None:
     """Run selected eval methods, write CSVs + terminal summary.
+
+    Args:
+        calib_seed: seed for the functional-CP 30/70 calibration split (see
+            ``eval_functional_conformal``). Pass the same value used when
+            reporting a metric so train/eval numbers match.
 
     Returns the primary metric (val_unseen functional-CP ``bal_acc`` averaged
     over alphas, or ``None`` if functional CP couldn't be computed), used by
@@ -254,6 +265,7 @@ def _evaluate_and_save(args, model, splits, scores, alphas, fixed_thresholds, ou
         df, _ = eval_functional_conformal(
             splits, scores, "model", alphas,
             calib_split_names=["val_seen"], test_split_names=["val_unseen"],
+            calib_seed=calib_seed,
         )
         df.to_csv(os.path.join(out_dir, f"functional_cp_{tag}.csv"), index=False)
         _print_functional(df, alphas, tag)
